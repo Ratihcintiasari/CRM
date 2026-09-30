@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Grafik 'Close Lost Unit' September 2026 per minggu, stacked per Status Reason.
+Input: data mentah CRM (ada kolom tanggal, Status Reason, Actual Revenue).
+Ada keterangan otomatis untuk Status Reason 'Close Lost Unspecified'."""
+import calendar
+import re
+import sys
+import textwrap
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+# ====== KONFIGURASI ======
+FILE_INPUT = "/content/Close Lost Unit Sept.xlsx"   # data mentah (.xlsx / .csv)
+SHEET = 0
+TAHUN = 2026
+BULAN = 9
+NAMA_BULAN = "Sep"
+JUDUL = "CLOSE LOST UNIT SEPTEMBER 2026 - PER WEEK"
+DATA_AS_OF = "Data as of Sep-29 2026"
+SATUAN_BAGI = 1e9                  # IDR Bio
+MODE_MINGGU = "senin"              # "senin"   = minggu Senin-Minggu (W1 = 1 s/d Minggu pertama)
+                                   # "tanggal" = W1: tgl 1-7, W2: 8-14, W3: 15-21, W4: 22-28, W5: 29+
+SEMBUNYIKAN_KOSONG = True          # kategori bernilai 0 semua minggu tidak ditampilkan
+KATA_UNSPECIFIED = "unspecified"   # Status Reason yang mengandung kata ini diberi keterangan
+FILE_PNG = "close_lost_unit_sept_weekly.png"
+FILE_XLSX = "close_lost_unit_sept_weekly.xlsx"
+
+# Nama kolom di file (cocok jika nama kolom MENGANDUNG teks ini, urut prioritas)
+KOLOM_TANGGAL = ["actual close date", "est. close date"]   # kalau kosong, pakai yang berikutnya
+KOLOM_ALASAN = ["status reason"]
+KOLOM_NILAI = ["est. revenue"]
+
+WARNA_TETAP = {"Product Spec": "#1B6B8F", "Lead Time": "#ED7D31",
+               "Price": "#1E6B2A", "Others": "#7030A0",
+               "Close Lost Unspecified": "#B03A2E"}
+PALET = ["#E6B800", "#C0392B", "#2E86C1", "#7F8C8D", "#16A085",
+         "#D35400", "#8E6E53", "#2C3E50", "#AF7AC5", "#58D68D"]
+
+
+def cari_kolom(df, daftar, wajib=True):
+    for teks in daftar:
+        for c in df.columns:
+            if teks in str(c).strip().lower():
+                return c
+    if wajib:
+        sys.exit(f"ERROR: kolom {daftar} tidak ditemukan.\nKolom di file: {list(df.columns)}")
+    return None
+
+
+def parse_rupiah(v):
+    if pd.isna(v):
+        return np.nan
+    if isinstance(v, (int, float, np.number)):
+        return float(v)
+    s = re.sub(r"[^\d.,]", "", str(v))
+    if not s:
+        return np.nan
+    if s.count(".") > 1:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", "")
+    return float(s)
+
+
+def nama_kategori(label):
+    baku = {"price": "Price", "product spec": "Product Spec",
+            "lead time": "Lead Time", "others": "Others", "other": "Others"}
+    l = re.sub(r"\s+", " ", str(label)).strip()
+    return baku.get(l.lower(), l)
+
+
+def fmt_angka(x):
+    if x == 0 or pd.isna(x):
+        return "-"
+    return f"{x + 1e-9:,.1f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def fmt_rp(bio):
+    return "Rp" + f"{bio * SATUAN_BAGI:,.0f}".replace(",", ".")
+
+
+# ---------- minggu ----------
+HARI_TERAKHIR = calendar.monthrange(TAHUN, BULAN)[1]
+OFFSET = calendar.weekday(TAHUN, BULAN, 1) if MODE_MINGGU == "senin" else 0
+JUMLAH_MINGGU = (HARI_TERAKHIR + OFFSET - 1) // 7 + 1
+
+
+def nomor_minggu(hari):
+    return (hari - 1 + OFFSET) // 7 + 1
+
+
+def label_minggu(w):
+    awal = max(1, (w - 1) * 7 - OFFSET + 1)
+    akhir = min(HARI_TERAKHIR, w * 7 - OFFSET)
+    return f"W{w} ({awal}-{akhir} {NAMA_BULAN})"
+
+
+def baca():
+    p = Path(FILE_INPUT)
+    if not p.exists():
+        sys.exit(f"ERROR: file '{FILE_INPUT}' tidak ditemukan.")
+    df = (pd.read_excel(p, sheet_name=SHEET) if p.suffix.lower() in (".xlsx", ".xls")
+          else pd.read_csv(p, sep=None, engine="python", encoding="utf-8-sig"))
+    print("Jumlah baris di file:", len(df))
+
+    kol_alasan = cari_kolom(df, KOLOM_ALASAN)
+    kol_nilai = cari_kolom(df, KOLOM_NILAI)
+
+    # tanggal: pakai kolom prioritas pertama, baris kosong diisi kolom berikutnya
+    tgl = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    dipakai = []
+    for teks in KOLOM_TANGGAL:
+        c = cari_kolom(df, [teks], wajib=False)
+        if c is not None:
+            tgl = tgl.fillna(pd.to_datetime(df[c], errors="coerce", dayfirst=True))
+            dipakai.append(c)
+    if not dipakai:
+        sys.exit(f"ERROR: kolom tanggal {KOLOM_TANGGAL} tidak ditemukan.\n"
+                 f"Kolom di file: {list(df.columns)}")
+    print(f"Kolom alasan : {kol_alasan!r}\nKolom nilai  : {kol_nilai!r}\nKolom tanggal: {dipakai}")
+
+    out = pd.DataFrame({
+        "kategori": df[kol_alasan].map(lambda v: nama_kategori(v) if pd.notna(v) else "(Tanpa Reason)"),
+        "nilai": df[kol_nilai].map(parse_rupiah) / SATUAN_BAGI,
+        "tgl": tgl,
+    })
+
+    tanpa_tgl = out[out["tgl"].isna()]
+    if len(tanpa_tgl):
+        print(f"PERINGATAN: {len(tanpa_tgl)} baris tanpa tanggal tidak dihitung "
+              f"(nilai {tanpa_tgl['nilai'].sum():,.3f}).")
+    di_luar = out[out["tgl"].notna() & ~((out["tgl"].dt.year == TAHUN) & (out["tgl"].dt.month == BULAN))]
+    if len(di_luar):
+        print(f"Info: {len(di_luar)} baris di luar {NAMA_BULAN} {TAHUN} diabaikan "
+              f"(nilai {di_luar['nilai'].sum():,.3f}).")
+    out = out[(out["tgl"].dt.year == TAHUN) & (out["tgl"].dt.month == BULAN)]
+    # nilai kosong dianggap 0 supaya opportunity tetap terhitung jumlahnya
+    out = out.assign(nilai=out["nilai"].fillna(0.0))
+    out = out.assign(minggu=out["tgl"].dt.day.map(nomor_minggu))
+    return out
+
+
+def hitung(df):
+    pv = (df.groupby(["minggu", "kategori"])["nilai"].sum().unstack(fill_value=0)
+            .reindex(index=range(1, JUMLAH_MINGGU + 1), fill_value=0))
+    urut = pv.sum().sort_values(ascending=False).index.tolist()     # terbesar di bawah
+    pv = pv[urut]
+    kat = [k for k in urut if not (SEMBUNYIKAN_KOSONG and abs(pv[k].sum()) < 1e-12)]
+    pv = pv[kat]
+    pv["Total"] = pv[kat].sum(axis=1)
+    pv.index = [label_minggu(w) for w in pv.index]
+
+    warna, i = dict(WARNA_TETAP), 0
+    for k in kat:
+        if k not in warna:
+            warna[k] = PALET[i % len(PALET)]
+            i += 1
+    return pv, kat, warna
+
+
+def gambar(pv, kat, warna, keterangan):
+    n = len(pv)
+    x = np.arange(n)
+    nb = len(kat) + 1
+    ket = textwrap.fill(keterangan, 135)
+    baris_ket = ket.count("\n") + 1
+    h_ket = 0.22 * baris_ket
+    H = 1.0 + 3.6 + 0.6 + 0.3 * (nb + 1) + 1.0 + 0.3 + h_ket
+    fig = plt.figure(figsize=(11, H))
+
+    def pos(bawah_in, tinggi_in):
+        return [0.11, bawah_in / H, 0.78, tinggi_in / H]
+
+    y_tab = 0.9 + 0.3 + h_ket
+    h_tab = 0.3 * (nb + 1)
+    ax_tab = fig.add_axes(pos(y_tab, h_tab))
+    ax_tab.axis("off")
+    ax = fig.add_axes(pos(y_tab + h_tab + 0.6, 3.6))
+
+    bawah = np.zeros(n)
+    for a in kat:
+        ax.bar(x, pv[a], 0.45, bottom=bawah, color=warna[a], zorder=2)
+        bawah += pv[a].values
+
+    ax.plot(x, pv["Total"], color="black", ls="--", marker="o", ms=4, lw=1.1, zorder=4)
+    for xi, v in zip(x, pv["Total"]):
+        ax.annotate(fmt_angka(v), (xi, v), textcoords="offset points",
+                    xytext=(0, 7), ha="center", fontsize=9, fontweight="bold", color="#333")
+
+    ymax = max(pv["Total"].max(), 1) * 1.2
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(0, ymax)
+    ax.set_xticks(x)
+    ax.set_xticklabels(pv.index, fontsize=9, color="#555")
+    ax.yaxis.set_major_formatter(lambda v, _: fmt_angka(v))
+    ax.tick_params(axis="y", labelsize=8, colors="#555", length=0)
+    ax.tick_params(axis="x", length=0)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color("#bbbbbb")
+
+    ax2 = ax.twinx()
+    ax2.set_ylim(0, ymax)
+    ax2.set_yticks(ax.get_yticks())
+    ax2.set_ylim(0, ymax)
+    ax2.yaxis.set_major_formatter(lambda v, _: fmt_angka(v))
+    ax2.tick_params(axis="y", labelsize=8, colors="#555", length=0)
+    for s in ("top", "right", "left", "bottom"):
+        ax2.spines[s].set_visible(False)
+
+    fig.text(0.5, 1 - 0.45 / H, JUDUL, ha="center", fontsize=15, fontweight="bold", color="#444")
+    fig.text(0.5, 1 - 0.75 / H, "(IDR Bio)", ha="center", fontsize=10, color="#666")
+
+    baris = kat[::-1] + ["Total"]
+    isi = [[fmt_angka(v) if (r == "Total" or v != 0) else "" for v in pv[r]] for r in baris]
+    tbl = ax_tab.table(cellText=isi, rowLabels=baris, colLabels=list(pv.index),
+                       cellLoc="center", loc="center", bbox=[0, 0, 1, 1])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8.5)
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#cccccc")
+        cell.set_linewidth(0.6)
+        if c == -1 and r >= 1 and baris[r - 1] in warna:
+            cell.set_facecolor(warna[baris[r - 1]])
+            cell.get_text().set_color("white")
+            cell.get_text().set_fontweight("bold")
+
+    # keterangan Close Lost Unspecified (di bawah tabel)
+    fig.text(0.11, (y_tab - 0.12) / H, ket, ha="left", va="top", fontsize=8,
+             color="#B03A2E", style="italic")
+
+    handel = [Patch(color=warna[a], label=a) for a in kat] + \
+             [Line2D([0], [0], color="black", ls="--", marker="o", ms=4, label="Total")]
+    fig.legend(handles=handel, loc="lower center", ncol=min(len(handel), 5), frameon=False,
+               fontsize=9, bbox_to_anchor=(0.5, 0.2 / H))
+    fig.text(0.02, 0.1 / H, DATA_AS_OF, fontsize=8, style="italic")
+    fig.savefig(FILE_PNG, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close(fig)
+
+
+def main():
+    df = baca()
+    if df.empty:
+        sys.exit(f"ERROR: tidak ada data {NAMA_BULAN} {TAHUN} yang bisa diolah.")
+    print("\n=== Total per kategori (IDR Bio) - cocokkan dengan pivot ===")
+    print(df.groupby("kategori")["nilai"].sum().round(3).sort_values(ascending=False).to_string())
+    print(f"TOTAL: {df['nilai'].sum():,.3f}\n")
+
+    keterangan = buat_keterangan(df)
+    print(keterangan, "\n")
+
+    pv, kat, warna = hitung(df)
+    gambar(pv, kat, warna, keterangan)
+    pv.round(1).T.to_excel(FILE_XLSX)
+    print(pv.round(1).T.to_string())
+    print(f"\nGrafik: {FILE_PNG}\nTabel : {FILE_XLSX}")
+    try:                                     # khusus Colab: unduh otomatis
+        from google.colab import files
+        files.download(FILE_PNG)
+    except ImportError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
